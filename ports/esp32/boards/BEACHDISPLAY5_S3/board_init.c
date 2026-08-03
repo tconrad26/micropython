@@ -49,7 +49,7 @@
 // deadline and it resets, restarting boot and missing the deadline again
 // (a ~10s reboot loop). Normally lib/boot_wdt.py handles this, started as
 // the very first thing in boot.py -- but this C hook now runs BEFORE
-// boot.py, and can legitimately take up to OVERALL_TIMEOUT_MS (28s) if the
+// boot.py, and can legitimately take up to OVERALL_TIMEOUT_MS (15s) if the
 // modem is slow to attach, which blows straight through that 10s deadline
 // with nothing feeding the watchdog at all. Confirmed as a real risk
 // 2026-08-02, caught before it caused a field problem -- not yet actually
@@ -184,22 +184,42 @@ static const char *TAG = "bd5_modem_usb";
 
 // Modem attach timeout: how long we'll wait for it to enumerate before
 // giving up and letting boot continue without a suspended modem.
-// Bumped again 2026-08-02 (20000ms -> 30000ms): even 20s still timed out
-// intermittently on hardware with the cable genuinely connected -- actual
-// attach has ranged from ~400ms to a full timeout across repeated boots
-// this session, wider variance than originally assumed. The watchdog feed
-// task runs continuously for the whole duration regardless (see
-// wdt_feed_task above), so a longer window here doesn't reintroduce the
-// TPS3435 tSD risk this was already designed around.
-#define MODEM_ATTACH_TIMEOUT_MS   30000
+//
+// Tightened back down 2026-08-03 after finding and fixing the real root
+// cause of every attach failure this session: the modem's USB peripheral
+// was administratively disabled in its own NVM (AT+QCFGEXT="disusb",1 --
+// a stuck leftover from unrelated 2026-08-02 eDRX current-measurement
+// testing, fixed in modem_transport.py's connect(), see
+// project_modem_design.md). With disusb=0, confirmed attach on real
+// hardware in 1610ms. 10s leaves generous margin over that without
+// reintroducing the multi-minute waits used during diagnosis.
+#define MODEM_ATTACH_TIMEOUT_MS   10000
 // Outer safety-net timeout on the whole sequence (task creation +
 // power-on settle + attach wait + suspend). Must be comfortably larger
 // than MODEM_POWERON_SETTLE_MS + MODEM_ATTACH_TIMEOUT_MS.
-#define OVERALL_TIMEOUT_MS         40000
-// Modem needs a moment after power-on before it presents on USB, same
-// order of magnitude as the boot_wait_s used in tests/modem_at.py.
-// Bumped 3000ms -> 5000ms alongside the attach-timeout increase above.
-#define MODEM_POWERON_SETTLE_MS    5000
+#define OVERALL_TIMEOUT_MS        15000
+// Settle time between the I2C power-on/wake-pulse sequence finishing and
+// starting USB host bring-up. This is now SHORT and deliberately so.
+//
+// Was 5000ms, copied from the boot_wait_s convention in tests/modem_at.py
+// -- but that value covers a completely different thing: how long the
+// modem's *AT/UART interface* takes to come up after a cold power-on.
+// This delay was gating USB host bring-up, and a flat 5s delay here was
+// actively harmful once PSM deep sleep entered the picture: confirmed on
+// hardware 2026-08-03 that modem_transport.py arms the modem with T3324
+// (PSM active-time, AT+CPSMS "00000010" = 2s-units x 2 = 4 seconds) --
+// after the RESET_N wake pulse in modem_power_ensure_on() above, the
+// modem is only actually awake and attachable for ~4s before it
+// autonomously re-enters PSM on its own schedule, no AT/network activity
+// from us required or possible this early. A 5s settle before we even
+// start usb_host_install() meant we were starting to look *after* the
+// modem had already gone back to sleep, every single boot -- this, not
+// USB-attach flakiness, was the real cause of the 30s/120s timeouts.
+// Confirmed via boot log: "usb_host up, waiting..." didn't print until
+// t=5859ms, well past the ~4s window. Now kept small, just enough for
+// the I2C/GPIO writes above to settle electrically, not for the modem to
+// do anything -- usb_host_install() runs immediately after.
+#define MODEM_POWERON_SETTLE_MS    200
 
 static i2c_master_bus_handle_t s_fxl_bus;
 static i2c_master_dev_handle_t s_fxl_dev;
@@ -263,8 +283,33 @@ static bool modem_power_ensure_on(void) {
 
     if (!ok) {
         ESP_LOGW(TAG, "fxl_main: register writes failed");
+        return false;
     }
-    return ok;
+
+    // PSM deep-sleep wake pulse. Mirrors _psm_deep_wake() in
+    // modem_transport.py exactly: a bounded LOW pulse on RESET_N (FXL bit
+    // 6, PERST# on the mini-PCIe connector) wakes the modem from AT+CPSMS
+    // deep sleep with TAU preserved, per BG95-M3 datasheet Sec 4.2 (<2s
+    // LOW = PSM wake; >=2s = full reset -- 500ms matches the Python side).
+    // This unit runs with hardwareconfig.modem_psm_deep=true, T3412 up to
+    // 6h -- the modem's own PSM active/sleep timers persist across an
+    // ESP32-only reset exactly like DTR does (see note above), so this
+    // hook can inherit a modem that's mid-PSM from the *previous* session,
+    // same root cause class as the DTR issue. Confirmed on hardware
+    // 2026-08-03: network LED goes bright then dims again within a few
+    // seconds on its own, entirely without any AT/network activity from
+    // this hook -- that's the modem's internal PSM active-timer expiring
+    // on its own schedule, not anything we did. Issuing this pulse
+    // unconditionally (not gated on a config read -- config.json isn't
+    // reliably readable this early) is safe even on a genuine cold boot:
+    // a <2s RESET_N pulse this early, before anything depends on the
+    // modem being up yet, costs at most a brief extra boot cycle.
+    ESP_LOGI(TAG, "pulsing RESET_N low for PSM wake");
+    fxl_main_write_reg(FXL_REG_OUT, out_val & ~FXL_BIT_MODEM_RESET);  // RESET_N low
+    vTaskDelay(pdMS_TO_TICKS(500));
+    fxl_main_write_reg(FXL_REG_OUT, out_val);  // RESET_N high (released) again
+
+    return true;
 }
 
 // --- USB host: enumerate the modem and suspend it ---
@@ -328,7 +373,8 @@ static void modem_suspend_task(void *arg) {
 
     ESP_LOGI(TAG, "usb_host up, waiting up to %dms for modem to attach",
              MODEM_ATTACH_TIMEOUT_MS);
-    TickType_t deadline = xTaskGetTickCount() + pdMS_TO_TICKS(MODEM_ATTACH_TIMEOUT_MS);
+    TickType_t wait_start = xTaskGetTickCount();
+    TickType_t deadline = wait_start + pdMS_TO_TICKS(MODEM_ATTACH_TIMEOUT_MS);
     while (!s_device_connected && xTaskGetTickCount() < deadline) {
         usb_host_client_handle_events(s_client_hdl, pdMS_TO_TICKS(500));
     }
@@ -338,6 +384,8 @@ static void modem_suspend_task(void *arg) {
                  MODEM_ATTACH_TIMEOUT_MS);
         goto done;
     }
+    ESP_LOGI(TAG, "modem attached after %dms",
+             (int)((xTaskGetTickCount() - wait_start) * portTICK_PERIOD_MS));
 
     if (usb_host_device_open(s_client_hdl, s_connected_addr, &s_dev_hdl) != ESP_OK) {
         ESP_LOGW(TAG, "usb_host_device_open failed");
