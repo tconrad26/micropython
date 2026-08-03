@@ -19,5 +19,14 @@ dependencies:
     version: "~1.0.0"
     rules:
       - if: "target == esp32"
+  # beachdisplay5: USB Host Library, used once at boot to put the BG95-M3
+  # modem's USB link into genuine suspend (see boards/BEACHDISPLAY5_S3).
+  # Independently versioned/maintained component, not part of core esp-idf
+  # since v6.0 -- confirmed compatible with idf 5.5.2 (this project's
+  # pinned version) by a standalone build test, 2026-08-02.
+  espressif/usb:
+    version: "*"
+    rules:
+      - if: "target == esp32s3"
   idf:
     version: ">=5.3.0"

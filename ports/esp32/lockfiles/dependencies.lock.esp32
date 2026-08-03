@@ -25,11 +25,11 @@ dependencies:
   idf:
     source:
       type: idf
-    version: 5.5.1
+    version: 5.5.2
 direct_dependencies:
 - espressif/lan867x
 - espressif/mdns
 - idf
-manifest_hash: 40b684ab14058130e675aab422296e4ad9d87ee39c5aa46d7b3df55c245e14f5
+manifest_hash: 9839f42dd855f1ec82c7c3469b985585225de8650f0644d69b251e1789fda521
 target: esp32
 version: 2.0.0

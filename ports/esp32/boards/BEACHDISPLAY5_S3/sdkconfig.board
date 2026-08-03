@@ -1,0 +1,22 @@
+# This module is N8R8: 8MB Quad SPI NOR flash (confirmed 2026-08-02 --
+# esptool detected 8192k but the previous firmware's image header claimed
+# 2048k, which silently capped usable flash to 2MB until corrected here),
+# 8MB Quad SPI PSRAM (see mpconfigboard.cmake for the PSRAM note).
+CONFIG_ESPTOOLPY_FLASHSIZE_4MB=n
+CONFIG_ESPTOOLPY_FLASHSIZE_8MB=y
+CONFIG_PARTITION_TABLE_CUSTOM=y
+CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions-4MiBplus.csv"
+
+# QIO / 80MHz flash mode (previously boards/sdkconfig.flash_qio_80m,
+# which doesn't exist yet at v1.28.0 -- see mpconfigboard.cmake note).
+CONFIG_ESPTOOLPY_FLASHMODE_QIO=y
+CONFIG_ESPTOOLPY_FLASHFREQ_80M=y
+
+# NOTE 2026-08-02: previously tried disabling the secondary USB-Serial-JTAG
+# console here as a fix for a boot hang. REVERTED -- confirmed on hardware
+# that it did not fix the hang (identical hang reproduced even with
+# usb_host skipped entirely via the config jumper, ruling out usb_host
+# interference too) and appeared to introduce a new regression (the
+# MicroPython startup banner itself stopped appearing at all). Back to
+# the default secondary-console behavior while the actual cause of the
+# post-boot.py hang is still being isolated -- see project_modem_design.md.
