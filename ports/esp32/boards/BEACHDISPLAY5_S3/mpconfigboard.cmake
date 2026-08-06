@@ -44,3 +44,21 @@ set(SDKCONFIG_DEFAULTS
 set(MICROPY_SOURCE_BOARD
     ${MICROPY_BOARD_DIR}/board_init.c
 )
+
+# usbhost: MicroPython-callable attach()/suspend()/resume() wrapping the
+# same ESP-IDF usb_host calls board_init.c already uses at boot -- lets
+# ModemTransport re-establish USB suspend after a runtime modem power-
+# cycle instead of only once at ESP32 boot. Board-specific (only
+# BEACHDISPLAY5_S3 has the modem wired to native USB), not a general
+# ESP32 port module -- see usermods/usbhost/usbhost.c for the full
+# rationale and the not-yet-hardware-verified caveats.
+#
+# Path built from CMAKE_CURRENT_LIST_DIR (this file's own directory,
+# boards/BEACHDISPLAY5_S3/) rather than MICROPY_PORT_DIR -- that variable
+# is set in esp32_common.cmake, and this file's processing order relative
+# to that was not confirmed, so this avoids depending on it. Matches the
+# same CMAKE_CURRENT_LIST_DIR-relative style already used for MICROPY_DIR
+# at the top of this file.
+set(USER_C_MODULES
+    ${CMAKE_CURRENT_LIST_DIR}/../../usermods/usbhost
+)
