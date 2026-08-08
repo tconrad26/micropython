@@ -20,3 +20,15 @@ CONFIG_ESPTOOLPY_FLASHFREQ_80M=y
 # MicroPython startup banner itself stopped appearing at all). Back to
 # the default secondary-console behavior while the actual cause of the
 # post-boot.py hang is still being isolated -- see project_modem_design.md.
+
+# 2026-08-08: keep the IDF from bringing up USB-Serial-JTAG as a secondary
+# console behind MicroPython's back. The MICROPY_HW_ESP_USB_SERIAL_JTAG=0
+# override in mpconfigboard.h only stops MicroPython using it for stdio;
+# this stops the IDF console driver touching the shared USB pads at all,
+# which is what has to be true for usb_host to own the PHY.
+#
+# Differs from the reverted 2026-08-02 attempt: that one disabled the
+# secondary console while native USB CDC was still enabled, so the pads
+# stayed claimed and the banner went missing. Here CDC is off too and the
+# REPL is on UART0.
+CONFIG_ESP_CONSOLE_SECONDARY_NONE=y
