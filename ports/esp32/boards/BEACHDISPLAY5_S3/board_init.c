@@ -39,6 +39,7 @@
 #include "esp_heap_caps.h"
 #include "driver/i2c_master.h"
 #include "driver/gpio.h"
+#include "driver/uart.h"
 #include "usb/usb_host.h"
 #include "nvs_flash.h"
 #include "nvs.h"
@@ -185,19 +186,21 @@ static const char *TAG = "bd5_modem_usb";
 // Modem attach timeout: how long we'll wait for it to enumerate before
 // giving up and letting boot continue without a suspended modem.
 //
-// Tightened back down 2026-08-03 after finding and fixing the real root
-// cause of every attach failure this session: the modem's USB peripheral
-// was administratively disabled in its own NVM (AT+QCFGEXT="disusb",1 --
-// a stuck leftover from unrelated 2026-08-02 eDRX current-measurement
-// testing, fixed in modem_transport.py's connect(), see
-// project_modem_design.md). With disusb=0, confirmed attach on real
-// hardware in 1610ms. 10s leaves generous margin over that without
-// reintroducing the multi-minute waits used during diagnosis.
-#define MODEM_ATTACH_TIMEOUT_MS   10000
+// TEMPORARILY wide again (2026-08-03) for diagnosis -- do not ship.
+//
+// This was briefly tightened to 10s on the strength of a SINGLE observed
+// 1610ms attach right after the disusb fix. That was n=1 dressed up as
+// characterized behavior, and the very next boot that actually ran this
+// hook timed out at 10s. Attach time may well vary with the modem's
+// incoming state (cold vs. mid-PSM), which one sample cannot show.
+// Widened back to 120s so "did it attach at all, and how long did it
+// take" is answerable rather than truncated. Pick a production value
+// only after several real measurements across different entry states.
+#define MODEM_ATTACH_TIMEOUT_MS   120000
 // Outer safety-net timeout on the whole sequence (task creation +
 // power-on settle + attach wait + suspend). Must be comfortably larger
 // than MODEM_POWERON_SETTLE_MS + MODEM_ATTACH_TIMEOUT_MS.
-#define OVERALL_TIMEOUT_MS        15000
+#define OVERALL_TIMEOUT_MS        130000
 // Settle time between the I2C power-on/wake-pulse sequence finishing and
 // starting USB host bring-up. This is now SHORT and deliberately so.
 //
@@ -314,6 +317,103 @@ static bool modem_power_ensure_on(void) {
 
 // --- USB host: enumerate the modem and suspend it ---
 
+// --- TEMPORARY diagnostic: does the modem itself report SUSPEND? ---
+//
+// The open question this exists to answer (2026-08-03): the ESP32 side
+// attaching the modem and usb_host_lib_root_port_suspend() returning
+// ESP_OK is NOT the same as the modem's own USB block actually entering
+// suspend. Measured average current did not drop after the disusb fix
+// (it went UP, ~40mA), which is consistent with USB now enabled but
+// never actually suspended. Only the modem's own AT+QCFGEXT="usb/event"
+// can settle it: 0=CONNECT, 1=DISCONNECT, 2=SUSPEND, 3=RESUME.
+//
+// Queried over the AT-UART (UART1, tx=14/rx=15 per board_v4.py's
+// uart_modem) -- a completely separate physical interface from the USB
+// link being measured, which is the same approach the 2026-08-02
+// eDRX/Pi testing used. DTR is held low (wake) by
+// modem_power_ensure_on() above, so the AT interpreter is responsive at
+// this point in boot, well before the ~14s PSM entry observed on
+// hardware.
+//
+// REMOVE once this question is answered -- this is not production code.
+#define AT_UART_NUM     UART_NUM_1
+#define AT_UART_TX_IO   14
+#define AT_UART_RX_IO   15
+#define AT_UART_RTS_IO  17
+#define AT_UART_CTS_IO  16
+
+static bool s_atuart_ready = false;
+
+static void atuart_init(void) {
+    uart_config_t cfg = {
+        .baud_rate = 115200,
+        .data_bits = UART_DATA_8_BITS,
+        .parity = UART_PARITY_DISABLE,
+        .stop_bits = UART_STOP_BITS_1,
+        .flow_ctrl = UART_HW_FLOWCTRL_CTS_RTS,
+        .rx_flow_ctrl_thresh = 122,
+        .source_clk = UART_SCLK_DEFAULT,
+    };
+    if (uart_driver_install(AT_UART_NUM, 1024, 1024, 0, NULL, 0) != ESP_OK) {
+        ESP_LOGW(TAG, "atuart: driver install failed, skipping usb/event check");
+        return;
+    }
+    if (uart_param_config(AT_UART_NUM, &cfg) != ESP_OK ||
+        uart_set_pin(AT_UART_NUM, AT_UART_TX_IO, AT_UART_RX_IO,
+                     AT_UART_RTS_IO, AT_UART_CTS_IO) != ESP_OK) {
+        ESP_LOGW(TAG, "atuart: config failed, skipping usb/event check");
+        uart_driver_delete(AT_UART_NUM);
+        return;
+    }
+    s_atuart_ready = true;
+}
+
+// MUST run on every exit path before boot.py -- UART1 is the same
+// peripheral modem_transport.py constructs moments later.
+static void atuart_deinit(void) {
+    if (s_atuart_ready) {
+        uart_driver_delete(AT_UART_NUM);
+        s_atuart_ready = false;
+    }
+}
+
+static void atuart_query(const char *cmd, const char *label, const char *when) {
+    if (!s_atuart_ready) {
+        return;
+    }
+    uart_flush_input(AT_UART_NUM);
+    uart_write_bytes(AT_UART_NUM, cmd, strlen(cmd));
+
+    char resp[128] = {0};
+    int total = 0;
+    TickType_t deadline = xTaskGetTickCount() + pdMS_TO_TICKS(1500);
+    while (xTaskGetTickCount() < deadline && total < (int)sizeof(resp) - 1) {
+        int n = uart_read_bytes(AT_UART_NUM, (uint8_t *)resp + total,
+                                 sizeof(resp) - 1 - total, pdMS_TO_TICKS(200));
+        if (n > 0) {
+            total += n;
+        }
+    }
+    for (int i = 0; i < total; i++) {
+        if (resp[i] == '\r' || resp[i] == '\n') {
+            resp[i] = ' ';
+        }
+    }
+    ESP_LOGI(TAG, "atuart: %s (%s) -> \"%s\"", label, when,
+             total > 0 ? resp : "<no response>");
+}
+
+static void atuart_query_usb_event(const char *when) {
+    atuart_query("AT+QCFGEXT=\"usb/event\"\r\n", "usb/event", when);
+}
+
+// Answers "is USB still administratively enabled on the modem?"
+// independently of whether attach succeeds -- so a failed attach still
+// produces evidence instead of nothing.
+static void atuart_query_disusb(const char *when) {
+    atuart_query("AT+QCFGEXT=\"disusb\"\r\n", "disusb", when);
+}
+
 static usb_host_client_handle_t s_client_hdl;
 static usb_device_handle_t s_dev_hdl = NULL;
 static uint8_t s_connected_addr = 0;
@@ -327,10 +427,22 @@ static void client_event_cb(const usb_host_client_event_msg_t *event_msg, void *
     }
 }
 
+// DIAGNOSTIC (2026-08-08): usbhost.attach() from MicroPython never
+// receives USB_HOST_CLIENT_EVENT_NEW_DEV after a runtime modem
+// power-cycle, even with the client registered before the modem boots and
+// with the root port resumed first. Both obvious explanations were ruled
+// out on hardware, so the open question is whether the host LIBRARY is
+// seeing the disconnect/connect at all. These counters make that
+// observable from Python via usbhost.lib_status() instead of guessing.
+volatile uint32_t bd5_usb_lib_event_count = 0;
+volatile uint32_t bd5_usb_lib_last_flags = 0;
+
 static void usb_lib_task(void *arg) {
     while (1) {
         uint32_t event_flags;
         usb_host_lib_handle_events(portMAX_DELAY, &event_flags);
+        bd5_usb_lib_event_count++;
+        bd5_usb_lib_last_flags = event_flags;
         // No action needed on NO_CLIENTS/ALL_FREE -- we intentionally
         // leave the library installed (see file header).
     }
@@ -371,6 +483,14 @@ static void modem_suspend_task(void *arg) {
         goto done;
     }
 
+    // TEMPORARY diagnostics -- see atuart block above. Deliberately BEFORE
+    // the attach wait so that a failed attach still produces evidence
+    // (the previous placement, after attach, meant a timeout yielded
+    // nothing at all -- observed 2026-08-03).
+    atuart_init();
+    atuart_query_disusb("before attach");
+    atuart_query_usb_event("before attach");
+
     ESP_LOGI(TAG, "usb_host up, waiting up to %dms for modem to attach",
              MODEM_ATTACH_TIMEOUT_MS);
     TickType_t wait_start = xTaskGetTickCount();
@@ -386,6 +506,8 @@ static void modem_suspend_task(void *arg) {
     }
     ESP_LOGI(TAG, "modem attached after %dms",
              (int)((xTaskGetTickCount() - wait_start) * portTICK_PERIOD_MS));
+
+    atuart_query_usb_event("after attach, before suspend");
 
     if (usb_host_device_open(s_client_hdl, s_connected_addr, &s_dev_hdl) != ESP_OK) {
         ESP_LOGW(TAG, "usb_host_device_open failed");
@@ -404,10 +526,20 @@ static void modem_suspend_task(void *arg) {
     // an established suspend. Deliberately skip usb_host_uninstall() --
     // see file header.
     vTaskDelay(pdMS_TO_TICKS(300));
+    // Does the modem agree it's suspended? This is the actual question.
+    atuart_query_usb_event("after suspend call");
+
     usb_host_device_close(s_client_hdl, s_dev_hdl);
     usb_host_client_deregister(s_client_hdl);
 
+    // And does that state survive close+deregister? The file header
+    // asserts it does ("confirmed on hardware") -- this checks it from
+    // the modem's side rather than assuming.
+    vTaskDelay(pdMS_TO_TICKS(300));
+    atuart_query_usb_event("after close+deregister");
+
 done:
+    atuart_deinit();  // TEMPORARY -- must run on every exit path
     {
         size_t heap_after = heap_caps_get_free_size(MALLOC_CAP_INTERNAL);
         ESP_LOGI(TAG, "modem USB-suspend startup done, internal heap cost: %d bytes",
