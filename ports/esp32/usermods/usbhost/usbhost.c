@@ -42,6 +42,7 @@
 
 #include "py/runtime.h"
 #include "py/mphal.h"
+#include "py/mperrno.h"   // MP_EIO -- missing here caused the first-ever compile of this file to fail (2026-08-08)
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
