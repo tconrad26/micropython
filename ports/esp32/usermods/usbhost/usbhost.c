@@ -58,6 +58,15 @@
 #include "usb/usb_host.h"
 
 #define USBHOST_DEFAULT_ATTACH_TIMEOUT_MS 10000
+// usb_host_lib_root_port_suspend()/_resume() are asynchronous -- ESP_OK from
+// either call means "queued", not "done" (see their doc comments in
+// usb_host.h). This bounds how long usbhost_suspend()/usbhost_resume() wait
+// for the matching DEV_SUSPENDED/DEV_RESUMED client event that confirms the
+// queued action actually completed, before giving up and returning False.
+// Not a measured figure -- generous over the expected halt+flush+transition
+// sequence, which the docs describe as a few endpoint operations, not
+// anything that should take anywhere near this long in practice.
+#define USBHOST_SUSPEND_RESUME_TIMEOUT_MS 1000
 
 static const char *TAG = "usbhost";
 
@@ -70,6 +79,12 @@ static volatile bool s_device_present = false;   // library says a device is the
 static volatile bool s_have_open_device = false; // we hold an open handle
 static volatile uint32_t s_new_dev_count = 0;
 static volatile uint32_t s_dev_gone_count = 0;
+
+// Set by DEV_SUSPENDED/DEV_RESUMED client events -- the actual completion
+// signal for usb_host_lib_root_port_suspend()/_resume(), which are
+// themselves asynchronous. See USBHOST_SUSPEND_RESUME_TIMEOUT_MS.
+static volatile bool s_dev_suspended = false;
+static volatile bool s_dev_resumed = false;
 
 static esp_err_t s_last_err = ESP_OK;
 
@@ -112,6 +127,28 @@ static void usbhost_client_event_cb(const usb_host_client_event_msg_t *event_msg
             // client still holds something. Not fatal.
             usb_host_device_free_all();
             ESP_LOGI(TAG, "DEV_GONE handled, device released");
+            break;
+
+        case USB_HOST_CLIENT_EVENT_DEV_SUSPENDED:
+            // THE completion signal for usb_host_lib_root_port_suspend() --
+            // that call only queues the suspend; this is when it actually
+            // happened (port transitioned, every endpoint of every open
+            // device halted and flushed, clients notified). Previously
+            // nothing here waited for this at all -- usbhost_suspend()
+            // returned True as soon as the request was queued, which could
+            // race the client task actually processing it.
+            s_dev_suspended = true;
+            s_dev_resumed = false;
+            ESP_LOGI(TAG, "DEV_SUSPENDED");
+            break;
+
+        case USB_HOST_CLIENT_EVENT_DEV_RESUMED:
+            // Same asynchrony on the resume side. This firing is what
+            // actually means the device's endpoints are live again --
+            // ESP_OK from usb_host_lib_root_port_resume() alone does not.
+            s_dev_resumed = true;
+            s_dev_suspended = false;
+            ESP_LOGI(TAG, "DEV_RESUMED");
             break;
 
         default:
@@ -295,21 +332,66 @@ static MP_DEFINE_CONST_FUN_OBJ_VAR_BETWEEN(usbhost_attach_obj, 0, 1, usbhost_att
 // client registered and the device open. board_init.c closes only because
 // it is about to exit; a runtime caller that closes has no way to be told
 // the device later disappeared.
+//
+// usb_host_lib_root_port_suspend() is asynchronous (see usb_host.h's doc
+// comment on it): ESP_OK means the suspend was queued, not that it
+// happened yet -- the actual halt+flush+transition sequence runs later, in
+// whatever task pumps usb_host_lib_handle_events() (usbhost_lib_task
+// here). Returning True the instant the request is queued -- what this
+// function used to do -- gives the caller no guarantee the port has
+// actually finished suspending before it goes on to whatever comes next.
+// Waits for the real completion signal (DEV_SUSPENDED, set in
+// usbhost_client_event_cb()) instead.
 static mp_obj_t usbhost_suspend(void) {
     if (!s_have_open_device) {
         mp_raise_msg(&mp_type_RuntimeError,
                      MP_ERROR_TEXT("usbhost: attach() must succeed before suspend()"));
     }
+    // Clear before issuing the request, not after -- a stale True left over
+    // from a previous cycle must not cause an immediate false-positive return.
+    s_dev_suspended = false;
     s_last_err = usb_host_lib_root_port_suspend();
-    return s_last_err == ESP_OK ? mp_const_true : mp_const_false;
+    if (s_last_err != ESP_OK) {
+        return mp_const_false;
+    }
+    TickType_t deadline = xTaskGetTickCount() + pdMS_TO_TICKS(USBHOST_SUSPEND_RESUME_TIMEOUT_MS);
+    while (!s_dev_suspended && xTaskGetTickCount() < deadline) {
+        vTaskDelay(pdMS_TO_TICKS(10));
+    }
+    if (!s_dev_suspended) {
+        ESP_LOGW(TAG, "suspend() queued but DEV_SUSPENDED not observed within %dms",
+                 USBHOST_SUSPEND_RESUME_TIMEOUT_MS);
+        return mp_const_false;
+    }
+    return mp_const_true;
 }
 static MP_DEFINE_CONST_FUN_OBJ_0(usbhost_suspend_obj, usbhost_suspend);
 
 // usbhost.resume() -> bool
-// ESP_ERR_NOT_ALLOWED here means the port was not suspended.
+// ESP_ERR_NOT_ALLOWED here means the port was not suspended (may already
+// be usable) -- exit_edrx() treats that case as non-fatal, see its own
+// comment.
+//
+// Same asynchrony as usbhost_suspend() -- ESP_OK from
+// usb_host_lib_root_port_resume() means "queued", not "the device's
+// endpoints are live again". Waits for DEV_RESUMED instead of trusting
+// the queue-request return value alone.
 static mp_obj_t usbhost_resume(void) {
+    s_dev_resumed = false;
     s_last_err = usb_host_lib_root_port_resume();
-    return s_last_err == ESP_OK ? mp_const_true : mp_const_false;
+    if (s_last_err != ESP_OK) {
+        return mp_const_false;
+    }
+    TickType_t deadline = xTaskGetTickCount() + pdMS_TO_TICKS(USBHOST_SUSPEND_RESUME_TIMEOUT_MS);
+    while (!s_dev_resumed && xTaskGetTickCount() < deadline) {
+        vTaskDelay(pdMS_TO_TICKS(10));
+    }
+    if (!s_dev_resumed) {
+        ESP_LOGW(TAG, "resume() queued but DEV_RESUMED not observed within %dms",
+                 USBHOST_SUSPEND_RESUME_TIMEOUT_MS);
+        return mp_const_false;
+    }
+    return mp_const_true;
 }
 static MP_DEFINE_CONST_FUN_OBJ_0(usbhost_resume_obj, usbhost_resume);
 
@@ -358,12 +440,15 @@ static MP_DEFINE_CONST_FUN_OBJ_0(usbhost_lib_status_obj, usbhost_lib_status);
 
 // usbhost.client_status() -> (registered, new_dev_count, dev_gone_count,
 //                             device_present, have_open_device, addr,
-//                             lib_installed_by_us)
+//                             lib_installed_by_us, dev_suspended, dev_resumed)
 // dev_gone_count is the number that matters: if it stays 0 across a
 // verified modem power-cycle, DEV_GONE is still not being delivered and
 // this rewrite did not solve the problem.
+// dev_suspended/dev_resumed added alongside the suspend()/resume() wait-
+// for-completion fix -- lets a diagnostic confirm on real hardware that
+// the events are actually arriving, not just that the timeout isn't firing.
 static mp_obj_t usbhost_client_status(void) {
-    mp_obj_t items[7] = {
+    mp_obj_t items[9] = {
         s_client_hdl != NULL ? mp_const_true : mp_const_false,
         mp_obj_new_int_from_uint(s_new_dev_count),
         mp_obj_new_int_from_uint(s_dev_gone_count),
@@ -371,8 +456,10 @@ static mp_obj_t usbhost_client_status(void) {
         s_have_open_device ? mp_const_true : mp_const_false,
         MP_OBJ_NEW_SMALL_INT(s_connected_addr),
         s_lib_installed_by_us ? mp_const_true : mp_const_false,
+        s_dev_suspended ? mp_const_true : mp_const_false,
+        s_dev_resumed ? mp_const_true : mp_const_false,
     };
-    return mp_obj_new_tuple(7, items);
+    return mp_obj_new_tuple(9, items);
 }
 static MP_DEFINE_CONST_FUN_OBJ_0(usbhost_client_status_obj, usbhost_client_status);
 
