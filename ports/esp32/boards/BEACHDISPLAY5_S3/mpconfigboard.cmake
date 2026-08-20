@@ -10,9 +10,30 @@ if(NOT MICROPY_DIR)
     get_filename_component(MICROPY_DIR ${CMAKE_CURRENT_LIST_DIR}/../../../.. ABSOLUTE)
 endif()
 
+# boards/sdkconfig.ble REMOVED 2026-08-20 -- Beach Display doesn't use
+# Bluetooth/NimBLE anywhere in the application; it was only here because
+# this board's config was originally templated from one that had it on.
+# Confirmed unused via a full grep of the application code before removing.
+#
+# Direct cause: bumping this project's pinned ESP-IDF from 5.5.2 to 5.5.3
+# (needed for espressif/usb >=1.5.0's automatic root-port-suspend-before-
+# light-sleep fix -- see main/idf_component.yml) pulled in a newer NimBLE
+# submodule whose ble_hs_priv.h changed ble_hs_max_attrs/max_services/
+# max_client_configs from plain globals to a ble_hs_state_ctx-> struct
+# member. MicroPython's own extmod/nimble/modbluetooth_nimble.c (shared
+# upstream code, not anything in this fork) wasn't updated to match, so
+# it fails to compile against the newer NimBLE. Since nothing here uses
+# BLE, removing sdkconfig.ble avoids compiling that file at all rather
+# than patching shared upstream code for a feature this product doesn't
+# use.
+#
+# If you ever want Bluetooth back on this board: re-add boards/sdkconfig.ble
+# below, then either patch modbluetooth_nimble.c for the newer NimBLE
+# macro form yourself, or check whether a newer MicroPython release has
+# already fixed it upstream first -- that's the more likely place for
+# this to get resolved than by hand here.
 set(SDKCONFIG_DEFAULTS
     boards/sdkconfig.base
-    boards/sdkconfig.ble
     boards/sdkconfig.240mhz
     boards/sdkconfig.spiram_sx
     boards/sdkconfig.spiram_oct
