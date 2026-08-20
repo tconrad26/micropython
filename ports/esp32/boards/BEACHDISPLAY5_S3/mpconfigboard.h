@@ -50,3 +50,16 @@
 // the modem is missing/unresponsive.
 #define MICROPY_BOARD_STARTUP                BEACHDISPLAY5_S3_board_startup
 void BEACHDISPLAY5_S3_board_startup(void);
+
+// Removing boards/sdkconfig.ble (see mpconfigboard.cmake, 2026-08-20) turned
+// off CONFIG_BT_ENABLED/CONFIG_BT_NIMBLE_ENABLED at the ESP-IDF/sdkconfig
+// level, but extmod/nimble/modbluetooth_nimble.c is added to the build by
+// MicroPython's own CMakeLists.txt whenever MICROPY_PY_BLUETOOTH is truthy
+// (mpconfigport.h defines it 1 by default via #ifndef) -- NOT gated by the
+// sdkconfig BT flags. So removing sdkconfig.ble alone was not sufficient;
+// the build still tried to compile that file against a bt/nimble component
+// that CONFIG_BT_NIMBLE_ENABLED=n leaves in a state modbluetooth_nimble.c
+// doesn't expect, same 'ble_hs_max_attrs' compile error as before. This
+// override (processed before mpconfigport.h's #ifndef check) is what
+// actually stops the file from being compiled at all.
+#define MICROPY_PY_BLUETOOTH                (0)
