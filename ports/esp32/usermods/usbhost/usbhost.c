@@ -314,6 +314,20 @@ static mp_obj_t usbhost_attach(size_t n_args, const mp_obj_t *args) {
         vTaskDelay(pdMS_TO_TICKS(50));
     }
     if (!s_device_present) {
+        // FIXED 2026-08-20: this path used to return False without
+        // touching s_last_err at all, so usbhost.last_error() reported
+        // whatever stale value happened to be left over from some
+        // earlier, unrelated call -- confirmed misleading on real
+        // hardware: a repeatable cold-boot enumeration failure (SET_
+        // CONFIGURATION STALLing, per the ENUM: CHECK_CONFIG FAILED log
+        // from espressif/usb's own enum.c) reported err=ESP_OK here,
+        // looking like success despite attach() returning False. This
+        // branch is reached specifically when enumeration never gets far
+        // enough to deliver a NEW_DEV client event at all (e.g. it dies
+        // during SET_CONFIG, before s_device_present would ever be set)
+        // -- record that honestly instead of leaving the caller to infer
+        // it from a stale/unrelated error code.
+        s_last_err = ESP_ERR_TIMEOUT;
         return mp_const_false;
     }
 
