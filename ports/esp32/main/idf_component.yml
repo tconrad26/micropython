@@ -22,10 +22,18 @@ dependencies:
   # beachdisplay5: USB Host Library, used once at boot to put the BG95-M3
   # modem's USB link into genuine suspend (see boards/BEACHDISPLAY5_S3).
   # Independently versioned/maintained component, not part of core esp-idf
-  # since v6.0 -- confirmed compatible with idf 5.5.2 (this project's
-  # pinned version) by a standalone build test, 2026-08-02.
+  # since v6.0. Was unpinned ("*") and had resolved to 1.4.1 against idf
+  # 5.5.2 (dependencies.lock.esp32s3, confirmed 2026-08-02) -- explicitly
+  # pinned to 1.5.0 on 2026-08-20 for its "automatic root-port suspend
+  # before light sleep when esp_light_sleep_start() is called" fix
+  # (CHANGELOG.md, gated by CONFIG_ESP_SLEEP_EVENT_CALLBACKS), directly
+  # relevant to the BD00009/BD00010 eDRX+USB current-spike investigation.
+  # NOTE: 1.5.0 requires idf >=5.5.3, one patch above the 5.5.2 that was
+  # locked -- the build machine's ESP-IDF checkout must be bumped to
+  # >=5.5.3 before `idf.py reconfigure` will re-resolve to this version;
+  # otherwise the component manager will refuse it and fall back.
   espressif/usb:
-    version: "*"
+    version: "^1.5.0"
     rules:
       - if: "target == esp32s3"
   idf:
