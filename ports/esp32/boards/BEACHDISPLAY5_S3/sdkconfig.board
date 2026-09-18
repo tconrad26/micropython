@@ -32,3 +32,27 @@ CONFIG_ESPTOOLPY_FLASHFREQ_80M=y
 # stayed claimed and the banner went missing. Here CDC is off too and the
 # REPL is on UART0.
 CONFIG_ESP_CONSOLE_SECONDARY_NONE=y
+
+# 2026-09-18: intermittent cold-attach enumeration failure against the
+# BG95-M3 modem (project_backlog.md Item 4, steps 10-22) -- fresh/cold
+# attaches only, never a warm re-attach, logged as
+# "E ENUM: Bad transfer status 1: CHECK_SHORT_DEV_DESC" ==
+# USB_TRANSFER_STATUS_ERROR ("no response or CRC error", not a STALL) on
+# the very first control transfer (the short GET_DESCRIPTOR that reads
+# bMaxPacketSize0). enum.c only tolerates a STALL here for the string-
+# descriptor stages (see control_response_handling() in enum.c); any bad
+# status on CHECK_SHORT_DEV_DESC is fatal to that enumeration attempt.
+#
+# The default 30ms (CONFIG_USB_HOST_RESET_RECOVERY_MS, already 3x the USB
+# 2.0 spec's 10ms minimum per Kconfig's own "set to 30ms to be safe") is
+# not misconfigured -- the suspected cause is the OTHER side: this
+# specific modem's own internal USB PHY/stack bring-up after a genuine
+# physical attach/reset occasionally taking longer than a fixed 30ms
+# window calibrated for typical simple peripherals, not this composite,
+# multi-interface device. Bumped well past any plausible bring-up jitter
+# as a testable experiment, not a guess dressed as a fix -- if this
+# measurably reduces/eliminates the fast (~1min, first-cycle)
+# reproduction now available via tests/diag_modem_edrx_usb_isolated_
+# watched.py, that's real evidence for the mechanism, not just a
+# plausible story.
+CONFIG_USB_HOST_RESET_RECOVERY_MS=150
