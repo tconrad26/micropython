@@ -123,6 +123,17 @@ static void usbhost_client_event_cb(const usb_host_client_event_msg_t *event_msg
             }
             s_device_present = false;
             s_connected_addr = 0;
+            // FIXED 2026-09-18: neither flag was ever cleared here, so a
+            // device that disconnected while suspended stayed reported as
+            // dev_suspended=True (confirmed on hardware: client_status()
+            // showed device_present=False, have_open_device=False, and
+            // dev_suspended=True simultaneously, in tio_9_18_0.log). A
+            // fresh DEV_GONE means whatever suspend/resume state existed
+            // is gone with it -- both are stale from here regardless of
+            // what happens next (a same-address recovery or a genuinely
+            // new device at a new address).
+            s_dev_suspended = false;
+            s_dev_resumed = false;
             // Best-effort: may return ESP_ERR_NOT_FINISHED if another
             // client still holds something. Not fatal.
             usb_host_device_free_all();
