@@ -488,6 +488,250 @@ static mp_obj_t usbhost_client_status(void) {
 }
 static MP_DEFINE_CONST_FUN_OBJ_0(usbhost_client_status_obj, usbhost_client_status);
 
+// ---------------------------------------------------------------------------
+// Bulk transfers on the open device (2026-10-20).
+//
+// Why: when the BG95 crashes with AT+QCFGEXT="dump",1 it re-enumerates as the Qualcomm ram-dump device
+// ("QUSB_BULK_SN:...", ONE interface, a bulk IN + a bulk OUT endpoint). Reading that dump over USB needs bulk
+// transfers; until now this module only suspended/resumed. The ESP32-S3 host is full-speed only, so the dump
+// runs at 12 Mbit/s here (the Pi's high-speed link failed with babble/protocol errors on this unit).
+//
+// API (all need a successful attach() first):
+//   usbhost.dev_info()            -> (vid, pid, speed, manufacturer, product, serial) or None
+//   usbhost.endpoints()           -> [(interface, ep_addr, bmAttributes, max_packet), ...]
+//   usbhost.claim(iface[, alt])   -> bool       usbhost.release(iface) -> bool
+//   usbhost.bulk_in(ep, buf, timeout_ms=1000)   fills `buf` (writable), returns bytes received
+//   usbhost.bulk_out(ep, data, timeout_ms=1000) returns bytes sent
+//   usbhost.xfer_status()         -> raw usb_transfer_status_t of the last transfer (0 = completed,
+//                                    1 error, 2 timed out, 3 canceled, 4 stall, 5 OVERFLOW, 6 skipped, 7 no device)
+// Failures set usbhost.last_error(); bulk_in/out return the bytes moved before the failure.
+// ---------------------------------------------------------------------------
+
+#define USBHOST_BULK_CHUNK 4096     // multiple of 512 so IN requests satisfy every max-packet size
+
+static volatile bool s_xfer_done = false;
+static volatile int s_xfer_status = 0;
+static volatile int s_xfer_actual = 0;
+
+static void usbhost_xfer_cb(usb_transfer_t *t) {
+    s_xfer_status = (int)t->status;
+    s_xfer_actual = t->actual_num_bytes;
+    s_xfer_done = true;
+}
+
+// Submit one prepared transfer and wait for its callback. Polls like the rest of this module (no GIL games).
+// Returns ESP_OK only for a COMPLETED transfer. On a timeout the endpoint is halted/flushed so the callback
+// fires; if even that does not complete, *leaked is set and the caller must NOT free the transfer.
+static esp_err_t usbhost_run_xfer(usb_transfer_t *x, uint8_t ep, size_t n, int timeout_ms, bool *leaked) {
+    x->device_handle = s_dev_hdl;
+    x->bEndpointAddress = ep;
+    x->num_bytes = n;
+    x->callback = usbhost_xfer_cb;
+    x->context = NULL;
+    x->timeout_ms = 0;
+    s_xfer_done = false;
+    s_xfer_status = 0;
+    s_xfer_actual = 0;
+    esp_err_t err = usb_host_transfer_submit(x);
+    if (err != ESP_OK) {
+        return err;
+    }
+    TickType_t deadline = xTaskGetTickCount() + pdMS_TO_TICKS(timeout_ms);
+    while (!s_xfer_done && xTaskGetTickCount() < deadline) {
+        vTaskDelay(1);
+    }
+    if (!s_xfer_done) {
+        usb_host_endpoint_halt(s_dev_hdl, ep);
+        usb_host_endpoint_flush(s_dev_hdl, ep);
+        TickType_t d2 = xTaskGetTickCount() + pdMS_TO_TICKS(1000);
+        while (!s_xfer_done && xTaskGetTickCount() < d2) {
+            vTaskDelay(1);
+        }
+        usb_host_endpoint_clear(s_dev_hdl, ep);
+        if (!s_xfer_done) {
+            *leaked = true;
+        }
+        return ESP_ERR_TIMEOUT;
+    }
+    return (s_xfer_status == USB_TRANSFER_STATUS_COMPLETED) ? ESP_OK : ESP_FAIL;
+}
+
+static void usbhost_require_open(void) {
+    if (!s_have_open_device || s_dev_hdl == NULL) {
+        mp_raise_msg(&mp_type_RuntimeError, MP_ERROR_TEXT("usbhost: attach() must succeed first"));
+    }
+}
+
+static mp_obj_t usbhost_str_desc_obj(const usb_str_desc_t *s) {
+    if (s == NULL || s->bLength < 2) {
+        return mp_const_none;
+    }
+    char buf[64];
+    int n = (s->bLength - 2) / 2;
+    if (n > (int)sizeof(buf) - 1) {
+        n = sizeof(buf) - 1;
+    }
+    for (int i = 0; i < n; i++) {
+        buf[i] = (char)(s->wData[i] & 0x7f);
+    }
+    return mp_obj_new_str(buf, n);
+}
+
+static mp_obj_t usbhost_dev_info(void) {
+    usbhost_require_open();
+    usb_device_info_t info;
+    s_last_err = usb_host_device_info(s_dev_hdl, &info);
+    if (s_last_err != ESP_OK) {
+        return mp_const_none;
+    }
+    const usb_device_desc_t *dd = NULL;
+    usb_host_get_device_descriptor(s_dev_hdl, &dd);
+    mp_obj_t t[6];
+    t[0] = dd ? MP_OBJ_NEW_SMALL_INT(dd->idVendor) : mp_const_none;
+    t[1] = dd ? MP_OBJ_NEW_SMALL_INT(dd->idProduct) : mp_const_none;
+    t[2] = MP_OBJ_NEW_SMALL_INT((int)info.speed);        // 0 low, 1 full, 2 high
+    t[3] = usbhost_str_desc_obj(info.str_desc_manufacturer);
+    t[4] = usbhost_str_desc_obj(info.str_desc_product);
+    t[5] = usbhost_str_desc_obj(info.str_desc_serial_num);
+    return mp_obj_new_tuple(6, t);
+}
+static MP_DEFINE_CONST_FUN_OBJ_0(usbhost_dev_info_obj, usbhost_dev_info);
+
+static mp_obj_t usbhost_endpoints(void) {
+    usbhost_require_open();
+    const usb_config_desc_t *cfg = NULL;
+    s_last_err = usb_host_get_active_config_descriptor(s_dev_hdl, &cfg);
+    if (s_last_err != ESP_OK || cfg == NULL) {
+        return mp_const_none;
+    }
+    const uint8_t *p = (const uint8_t *)cfg;
+    int total = cfg->wTotalLength;
+    int off = 0;
+    int iface = -1;
+    mp_obj_t list = mp_obj_new_list(0, NULL);
+    while (off + 2 <= total) {
+        uint8_t len = p[off];
+        uint8_t type = p[off + 1];
+        if (len < 2) {
+            break;
+        }
+        if (type == 4 && off + 9 <= total) {                    // interface descriptor
+            iface = p[off + 2];
+        } else if (type == 5 && len >= 7 && off + 7 <= total) { // endpoint descriptor
+            mp_obj_t t[4] = {
+                MP_OBJ_NEW_SMALL_INT(iface),
+                MP_OBJ_NEW_SMALL_INT(p[off + 2]),
+                MP_OBJ_NEW_SMALL_INT(p[off + 3]),
+                MP_OBJ_NEW_SMALL_INT(p[off + 4] | (p[off + 5] << 8)),
+            };
+            mp_obj_list_append(list, mp_obj_new_tuple(4, t));
+        }
+        off += len;
+    }
+    return list;
+}
+static MP_DEFINE_CONST_FUN_OBJ_0(usbhost_endpoints_obj, usbhost_endpoints);
+
+static mp_obj_t usbhost_claim(size_t n_args, const mp_obj_t *args) {
+    usbhost_require_open();
+    int iface = mp_obj_get_int(args[0]);
+    int alt = (n_args > 1) ? mp_obj_get_int(args[1]) : 0;
+    s_last_err = usb_host_interface_claim(s_client_hdl, s_dev_hdl, iface, alt);
+    return mp_obj_new_bool(s_last_err == ESP_OK);
+}
+static MP_DEFINE_CONST_FUN_OBJ_VAR_BETWEEN(usbhost_claim_obj, 1, 2, usbhost_claim);
+
+static mp_obj_t usbhost_release(mp_obj_t iface_in) {
+    usbhost_require_open();
+    s_last_err = usb_host_interface_release(s_client_hdl, s_dev_hdl, mp_obj_get_int(iface_in));
+    return mp_obj_new_bool(s_last_err == ESP_OK);
+}
+static MP_DEFINE_CONST_FUN_OBJ_1(usbhost_release_obj, usbhost_release);
+
+static mp_obj_t usbhost_bulk_in(size_t n_args, const mp_obj_t *args) {
+    usbhost_require_open();
+    uint8_t ep = mp_obj_get_int(args[0]);
+    mp_buffer_info_t bi;
+    mp_get_buffer_raise(args[1], &bi, MP_BUFFER_WRITE);
+    int timeout_ms = (n_args > 2) ? mp_obj_get_int(args[2]) : 1000;
+    usb_transfer_t *x = NULL;
+    s_last_err = usb_host_transfer_alloc(USBHOST_BULK_CHUNK, 0, &x);
+    if (s_last_err != ESP_OK) {
+        return MP_OBJ_NEW_SMALL_INT(0);
+    }
+    size_t got = 0;
+    bool leaked = false;
+    while (got < bi.len) {
+        size_t rem = bi.len - got;
+        size_t n = (rem + 511) & ~(size_t)511;               // IN requests must be a whole number of packets
+        if (n > USBHOST_BULK_CHUNK) {
+            n = USBHOST_BULK_CHUNK;
+        }
+        s_last_err = usbhost_run_xfer(x, ep, n, timeout_ms, &leaked);
+        if (s_last_err != ESP_OK) {
+            // a failed transfer can still have delivered some bytes before the error
+            size_t part = (s_xfer_actual > 0) ? (size_t)s_xfer_actual : 0;
+            if (part > rem) {
+                part = rem;
+            }
+            if (part && !leaked) {
+                memcpy((uint8_t *)bi.buf + got, x->data_buffer, part);
+                got += part;
+            }
+            break;
+        }
+        size_t actual = (size_t)s_xfer_actual;
+        size_t take = (actual > rem) ? rem : actual;
+        memcpy((uint8_t *)bi.buf + got, x->data_buffer, take);
+        got += take;
+        if (actual < n) {
+            break;                                           // short packet: the device has nothing more
+        }
+    }
+    if (!leaked) {
+        usb_host_transfer_free(x);
+    }
+    return MP_OBJ_NEW_SMALL_INT((mp_int_t)got);
+}
+static MP_DEFINE_CONST_FUN_OBJ_VAR_BETWEEN(usbhost_bulk_in_obj, 2, 3, usbhost_bulk_in);
+
+static mp_obj_t usbhost_bulk_out(size_t n_args, const mp_obj_t *args) {
+    usbhost_require_open();
+    uint8_t ep = mp_obj_get_int(args[0]);
+    mp_buffer_info_t bi;
+    mp_get_buffer_raise(args[1], &bi, MP_BUFFER_READ);
+    int timeout_ms = (n_args > 2) ? mp_obj_get_int(args[2]) : 1000;
+    usb_transfer_t *x = NULL;
+    s_last_err = usb_host_transfer_alloc(USBHOST_BULK_CHUNK, 0, &x);
+    if (s_last_err != ESP_OK) {
+        return MP_OBJ_NEW_SMALL_INT(0);
+    }
+    size_t sent = 0;
+    bool leaked = false;
+    while (sent < bi.len) {
+        size_t n = bi.len - sent;
+        if (n > USBHOST_BULK_CHUNK) {
+            n = USBHOST_BULK_CHUNK;
+        }
+        memcpy(x->data_buffer, (const uint8_t *)bi.buf + sent, n);
+        s_last_err = usbhost_run_xfer(x, ep, n, timeout_ms, &leaked);
+        if (s_last_err != ESP_OK) {
+            break;
+        }
+        sent += (size_t)s_xfer_actual;
+    }
+    if (!leaked) {
+        usb_host_transfer_free(x);
+    }
+    return MP_OBJ_NEW_SMALL_INT((mp_int_t)sent);
+}
+static MP_DEFINE_CONST_FUN_OBJ_VAR_BETWEEN(usbhost_bulk_out_obj, 2, 3, usbhost_bulk_out);
+
+static mp_obj_t usbhost_xfer_status(void) {
+    return MP_OBJ_NEW_SMALL_INT(s_xfer_status);
+}
+static MP_DEFINE_CONST_FUN_OBJ_0(usbhost_xfer_status_obj, usbhost_xfer_status);
+
 static const mp_rom_map_elem_t usbhost_module_globals_table[] = {
     { MP_ROM_QSTR(MP_QSTR___name__), MP_ROM_QSTR(MP_QSTR_usbhost) },
     { MP_ROM_QSTR(MP_QSTR_init),          MP_ROM_PTR(&usbhost_init_obj) },
@@ -499,6 +743,13 @@ static const mp_rom_map_elem_t usbhost_module_globals_table[] = {
     { MP_ROM_QSTR(MP_QSTR_last_error),    MP_ROM_PTR(&usbhost_last_error_obj) },
     { MP_ROM_QSTR(MP_QSTR_lib_status),    MP_ROM_PTR(&usbhost_lib_status_obj) },
     { MP_ROM_QSTR(MP_QSTR_client_status), MP_ROM_PTR(&usbhost_client_status_obj) },
+    { MP_ROM_QSTR(MP_QSTR_dev_info), MP_ROM_PTR(&usbhost_dev_info_obj) },
+    { MP_ROM_QSTR(MP_QSTR_endpoints), MP_ROM_PTR(&usbhost_endpoints_obj) },
+    { MP_ROM_QSTR(MP_QSTR_claim), MP_ROM_PTR(&usbhost_claim_obj) },
+    { MP_ROM_QSTR(MP_QSTR_release), MP_ROM_PTR(&usbhost_release_obj) },
+    { MP_ROM_QSTR(MP_QSTR_bulk_in), MP_ROM_PTR(&usbhost_bulk_in_obj) },
+    { MP_ROM_QSTR(MP_QSTR_bulk_out), MP_ROM_PTR(&usbhost_bulk_out_obj) },
+    { MP_ROM_QSTR(MP_QSTR_xfer_status), MP_ROM_PTR(&usbhost_xfer_status_obj) },
 };
 static MP_DEFINE_CONST_DICT(usbhost_module_globals, usbhost_module_globals_table);
 
